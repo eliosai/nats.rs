@@ -68,14 +68,14 @@ impl Route {
 
 impl Drop for Route {
     fn drop(&mut self) {
-        let unsubscribe = Command::Unsubscribe {
-            sid: self.sid,
-            max: None,
-        };
-        if let Err(TrySendError::Full(command)) = self.sender.try_send(unsubscribe) {
+        let sid = self.sid;
+        let unsubscribe = move || Command::Unsubscribe { sid, max: None };
+        if let Err(TrySendError::Full(_)) = self.sender.try_send(unsubscribe()) {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let sender = self.sender.clone();
-                runtime.spawn(async move { sender.send(command).await.ok() });
+                runtime.spawn(async move {
+                    sender.reserve().await.map(|slot| slot.send(unsubscribe()))
+                });
             }
         }
     }
