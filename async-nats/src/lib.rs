@@ -245,6 +245,7 @@ use connection::{Connection, State};
 use connector::{Connector, ConnectorOptions};
 pub use connector::{ReconnectToServer, Server};
 pub use header::{HeaderMap, HeaderName, HeaderValue};
+use route::Delivery;
 pub use subject::{Subject, SubjectError, ToSubject};
 
 mod auth;
@@ -253,6 +254,7 @@ pub mod client;
 pub mod connection;
 mod connector;
 mod options;
+mod route;
 
 pub use auth::Auth;
 pub use client::{
@@ -261,6 +263,7 @@ pub use client::{
     SubscribeError, SubscribeErrorKind,
 };
 pub use options::{AuthError, ConnectOptions};
+pub use route::Route;
 
 #[cfg(feature = "crypto")]
 #[cfg_attr(docsrs, doc(cfg(feature = "crypto")))]
@@ -396,7 +399,7 @@ pub(crate) enum Command {
         sid: u64,
         subject: Subject,
         queue_group: Option<String>,
-        sender: mpsc::Sender<Message>,
+        sender: Delivery,
     },
     Unsubscribe {
         sid: u64,
@@ -444,7 +447,7 @@ pub(crate) enum ClientOp {
 #[derive(Debug)]
 struct Subscription {
     subject: Subject,
-    sender: mpsc::Sender<Message>,
+    sender: Delivery,
     queue_group: Option<String>,
     delivered: u64,
     max: Option<u64>,
@@ -753,7 +756,7 @@ impl ConnectionHandler {
 
                     // if the channel for subscription was dropped, remove the
                     // subscription from the map and unsubscribe.
-                    match subscription.sender.try_send(message) {
+                    match subscription.sender.try_send(sid, message) {
                         Ok(_) => {
                             subscription.delivered += 1;
                             // if this `Subscription` has set `max` value, check if it

@@ -22,6 +22,7 @@ use crate::ServerInfo;
 
 use super::{header::HeaderMap, status::StatusCode, Command, Message, Subscriber};
 use crate::error::Error;
+use crate::route::{Delivery, Route};
 use bytes::Bytes;
 use futures_util::future::TryFutureExt;
 use futures_util::{Sink, SinkExt as _, StreamExt};
@@ -798,13 +799,58 @@ impl Client {
     /// # }
     /// ```
     pub async fn subscribe<S: ToSubject>(&self, subject: S) -> Result<Subscriber, SubscribeError> {
+        let (sender, receiver) = mpsc::channel(self.subscription_capacity);
+        let sid = self.subscribe_into(subject, Delivery::Own(sender)).await?;
+        Ok(Subscriber::new(sid, self.sender.clone(), receiver))
+    }
+
+    /// Subscribes to a subject, delivering its messages into a channel the caller owns.
+    ///
+    /// Each message arrives tagged with the returned [Route]'s sid, so one channel can serve
+    /// many subscriptions at a few bytes each. Dropping the [Route] unsubscribes; a message
+    /// the server sent before the unsubscribe reached it can still arrive with its sid. A full
+    /// channel drops the message and reports [crate::Event::SlowConsumer] with the sid.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("demo.nats.io").await?;
+    /// let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+    /// let orders = client.subscribe_with("orders.>", sender.clone()).await?;
+    /// let users = client.subscribe_with("users.>", sender).await?;
+    /// while let Some((sid, message)) = receiver.recv().await {
+    ///     if sid == orders.sid() {
+    ///         println!("order: {:?}", message);
+    ///     } else if sid == users.sid() {
+    ///         println!("user: {:?}", message);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn subscribe_with<S: ToSubject>(
+        &self,
+        subject: S,
+        sender: mpsc::Sender<(u64, Message)>,
+    ) -> Result<Route, SubscribeError> {
+        let sid = self
+            .subscribe_into(subject, Delivery::Shared(sender))
+            .await?;
+        Ok(Route::new(sid, self.sender.clone()))
+    }
+
+    async fn subscribe_into<S: ToSubject>(
+        &self,
+        subject: S,
+        sender: Delivery,
+    ) -> Result<u64, SubscribeError> {
         let subject = self
             .validate_subscribe_subject(subject)
             .map_err(|e| SubscribeError::with_source(SubscribeErrorKind::InvalidSubject, e))?;
 
         let sid = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = mpsc::channel(self.subscription_capacity);
-
         self.sender
             .send(Command::Subscribe {
                 sid,
@@ -814,7 +860,7 @@ impl Client {
             })
             .await?;
 
-        Ok(Subscriber::new(sid, self.sender.clone(), receiver))
+        Ok(sid)
     }
 
     /// Subscribes to a subject with a queue group to receive [messages][Message].
@@ -859,7 +905,7 @@ impl Client {
                 sid,
                 subject,
                 queue_group: Some(queue_group),
-                sender,
+                sender: Delivery::Own(sender),
             })
             .await?;
 
