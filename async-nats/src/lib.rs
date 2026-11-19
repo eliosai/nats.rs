@@ -245,7 +245,7 @@ use connection::{Connection, State};
 use connector::{Connector, ConnectorOptions};
 pub use connector::{ReconnectToServer, Server};
 use delivery::Delivery;
-pub use delivery::SubscriptionHandle;
+pub use delivery::{Route, Routed, SubscriptionHandle};
 pub use header::{HeaderMap, HeaderName, HeaderValue};
 pub use subject::{Subject, SubjectError, ToSubject};
 
@@ -823,6 +823,39 @@ impl ConnectionHandler {
         }
     }
 
+    fn publish(&mut self, message: OutboundMessage) {
+        let OutboundMessage {
+            subject,
+            payload,
+            reply: respond,
+            headers,
+        } = message;
+        self.connector
+            .connect_stats
+            .out_messages
+            .add(1, Ordering::Relaxed);
+
+        let header_len = headers
+            .as_ref()
+            .map(|headers| headers.len())
+            .unwrap_or_default();
+
+        self.connector.connect_stats.out_bytes.add(
+            (payload.len()
+                + respond.as_ref().map_or_else(|| 0, |r| r.len())
+                + subject.len()
+                + header_len) as u64,
+            Ordering::Relaxed,
+        );
+
+        self.connection.enqueue_write_op(&ClientOp::Publish {
+            subject,
+            payload,
+            respond,
+            headers,
+        });
+    }
+
     fn handle_command(&mut self, command: Command) {
         match command {
             Command::Unsubscribe { sid, max } => {
@@ -935,37 +968,8 @@ impl ConnectionHandler {
                 self.connection.enqueue_write_op(&pub_op);
             }
 
-            Command::Publish(OutboundMessage {
-                subject,
-                payload,
-                reply: respond,
-                headers,
-            }) => {
-                self.connector
-                    .connect_stats
-                    .out_messages
-                    .add(1, Ordering::Relaxed);
+            Command::Publish(message) => self.publish(message),
 
-                let header_len = headers
-                    .as_ref()
-                    .map(|headers| headers.len())
-                    .unwrap_or_default();
-
-                self.connector.connect_stats.out_bytes.add(
-                    (payload.len()
-                        + respond.as_ref().map_or_else(|| 0, |r| r.len())
-                        + subject.len()
-                        + header_len) as u64,
-                    Ordering::Relaxed,
-                );
-
-                self.connection.enqueue_write_op(&ClientOp::Publish {
-                    subject,
-                    payload,
-                    respond,
-                    headers,
-                });
-            }
 
             Command::Reconnect => {
                 self.should_reconnect = true;

@@ -19,18 +19,57 @@ use tokio::sync::mpsc::error::TrySendError;
 
 use crate::{Command, Message, UnsubscribeError};
 
-/// Where a subscription's messages go: its own channel, or a caller's channel tagged by sid.
-#[derive(Debug)]
+/// Takes each message of a subscription made with [crate::Client::subscribe_with_route] on the
+/// connection task, as it is read.
+///
+/// `deliver` runs inside the task that reads and writes the connection, so it must never block
+/// and should only move the message somewhere and wake whoever reads it. A route lives until its
+/// [`SubscriptionHandle`] or the client drops, or until it answers [`Routed::Closed`], and the
+/// connection drops it then.
+pub trait Route: Send + Sync + 'static {
+    /// Takes one message without blocking.
+    fn deliver(&mut self, message: Message) -> Routed;
+}
+
+/// What a [`Route`] did with one message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Routed {
+    /// The route took the message.
+    Taken,
+    /// The route had no room and dropped the message, which raises a slow consumer event.
+    Full,
+    /// The route wants no more messages, which unsubscribes it.
+    Closed,
+}
+
+/// Where a subscription's messages go: its own channel, a caller's channel tagged by sid, or a
+/// caller's route.
 pub(crate) enum Delivery {
     Own(mpsc::Sender<Message>),
     Shared(mpsc::Sender<(u64, Message)>),
+    Routed(Box<dyn Route>),
+}
+
+impl std::fmt::Debug for Delivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Delivery::Own(sender) => f.debug_tuple("Own").field(sender).finish(),
+            Delivery::Shared(sender) => f.debug_tuple("Shared").field(sender).finish(),
+            Delivery::Routed(_) => f.write_str("Routed"),
+        }
+    }
 }
 
 impl Delivery {
-    pub(crate) fn try_send(&self, sid: u64, message: Message) -> Result<(), TrySendError<()>> {
+    pub(crate) fn try_send(&mut self, sid: u64, message: Message) -> Result<(), TrySendError<()>> {
         match self {
             Delivery::Own(sender) => sender.try_send(message).map_err(forget),
             Delivery::Shared(sender) => sender.try_send((sid, message)).map_err(forget),
+            Delivery::Routed(route) => match route.deliver(message) {
+                Routed::Taken => Ok(()),
+                Routed::Full => Err(TrySendError::Full(())),
+                Routed::Closed => Err(TrySendError::Closed(())),
+            },
         }
     }
 
@@ -38,6 +77,7 @@ impl Delivery {
         match self {
             Delivery::Own(sender) => sender.is_closed(),
             Delivery::Shared(sender) => sender.is_closed(),
+            Delivery::Routed(_) => false,
         }
     }
 }
