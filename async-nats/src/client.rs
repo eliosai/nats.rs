@@ -21,7 +21,7 @@ use crate::subject::ToSubject;
 use crate::ServerInfo;
 
 use super::{header::HeaderMap, status::StatusCode, Command, Message, Subscriber};
-use crate::delivery::{Delivery, SubscriptionHandle};
+use crate::delivery::{Delivery, Route, SubscriptionHandle};
 use crate::error::Error;
 use bytes::Bytes;
 use futures_util::future::TryFutureExt;
@@ -833,6 +833,41 @@ impl Client {
     ) -> Result<SubscriptionHandle, SubscribeError> {
         let sid = self
             .subscribe_into(subject, None, Delivery::Shared(sender))
+            .await?;
+        Ok(SubscriptionHandle::new(sid, self.sender.clone()))
+    }
+
+    /// Subscribes to a subject and hands each message to `route` on the connection task, as it
+    /// is read.
+    ///
+    /// No channel or task stands between the connection and the route, so `route` must take each
+    /// message without blocking. The route drops when the returned [`SubscriptionHandle`] or the
+    /// client drops, and the subscription is renewed on reconnect like any other.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// struct Count(u64);
+    /// impl async_nats::Route for Count {
+    ///     fn deliver(&mut self, _message: async_nats::Message) -> async_nats::Routed {
+    ///         self.0 += 1;
+    ///         async_nats::Routed::Taken
+    ///     }
+    /// }
+    /// let client = async_nats::connect("demo.nats.io").await?;
+    /// let handle = client.subscribe_with_route("events.>", Count(0)).await?;
+    /// # drop(handle);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn subscribe_with_route<S: ToSubject, R: Route>(
+        &self,
+        subject: S,
+        route: R,
+    ) -> Result<SubscriptionHandle, SubscribeError> {
+        let sid = self
+            .subscribe_into(subject, None, Delivery::Routed(Box::new(route)))
             .await?;
         Ok(SubscriptionHandle::new(sid, self.sender.clone()))
     }
