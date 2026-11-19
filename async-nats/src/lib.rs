@@ -388,6 +388,7 @@ pub type PublishMessage = crate::message::OutboundMessage;
 #[derive(Debug)]
 pub(crate) enum Command {
     Publish(OutboundMessage),
+    PublishBatch(Vec<OutboundMessage>),
     Request {
         subject: Subject,
         payload: Bytes,
@@ -970,6 +971,11 @@ impl ConnectionHandler {
 
             Command::Publish(message) => self.publish(message),
 
+            Command::PublishBatch(messages) => {
+                for message in messages {
+                    self.publish(message);
+                }
+            }
 
             Command::Reconnect => {
                 self.should_reconnect = true;
