@@ -872,6 +872,58 @@ impl Client {
         Ok(SubscriptionHandle::new(sid, self.sender.clone()))
     }
 
+    /// Publishes every message in order as one command to the connection.
+    ///
+    /// Each message's subject and size are checked first, so one refused message refuses the
+    /// whole batch and nothing is sent. The connection writes the same operations, in the same
+    /// order, as one publish per message would.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use async_nats::message::OutboundMessage;
+    /// let client = async_nats::connect("demo.nats.io").await?;
+    /// let messages = (0..3).map(|n: u8| OutboundMessage {
+    ///     subject: "events.data".into(),
+    ///     payload: n.to_string().into(),
+    ///     reply: None,
+    ///     headers: None,
+    /// });
+    /// client.publish_batch(messages.collect()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn publish_batch(&self, messages: Vec<OutboundMessage>) -> Result<(), PublishError> {
+        for message in &messages {
+            self.check_outbound(message)?;
+        }
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.sender.send(Command::PublishBatch(messages)).await?;
+        Ok(())
+    }
+
+    /// Checks that one message is publishable on this connection: a valid
+    /// subject and a wire size within the negotiated `max_payload`.
+    ///
+    /// [Client::publish_batch] runs this check on every message before it
+    /// sends any, so a caller that batches can check each message as it
+    /// collects it and learn which one would fail.
+    pub fn check_outbound(&self, message: &OutboundMessage) -> Result<(), PublishError> {
+        if message.subject.is_empty()
+            || (!self.skip_subject_validation && !crate::is_valid_publish_subject(&message.subject))
+        {
+            return Err(PublishError::with_source(
+                PublishErrorKind::InvalidSubject,
+                crate::subject::SubjectError::InvalidFormat,
+            ));
+        }
+        self.check_payload_size(message.headers.as_ref(), message.payload.len())
+            .map_err(max_payload_error)
+    }
+
     async fn subscribe_into<S: ToSubject>(
         &self,
         subject: S,
