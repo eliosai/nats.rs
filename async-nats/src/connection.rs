@@ -511,40 +511,18 @@ impl Connection {
         respond: Option<&Subject>,
         headers: Option<&HeaderMap>,
     ) {
-        macro_rules! small_write {
-            ($dst:expr) => {
-                write!(self.small_write(), $dst).expect("do small write to Connection");
-            };
-        }
-
-        let verb = match headers {
-            Some(headers) if !headers.is_empty() => "HPUB",
-            _ => "PUB",
-        };
-
-        small_write!("{verb} {subject} ");
-
-        if let Some(respond) = respond {
-            small_write!("{respond} ");
-        }
-
+        let before = self.flattened_writes.len();
+        // The operation line and the headers go straight into the flattened tail,
+        // which always follows every queued buffer, so order holds.
+        let verb = encode_head(
+            &mut self.flattened_writes,
+            subject,
+            payload.len(),
+            respond,
+            headers,
+        );
+        self.write_buf_len += self.flattened_writes.len() - before;
         let payload_len = payload.len();
-        match headers {
-            Some(headers) if !headers.is_empty() => {
-                let headers_len = headers.wire_len();
-                let total_len = headers_len + payload_len;
-                small_write!("{headers_len} {total_len}\r\n");
-                // Headers go straight into the flattened tail, which
-                // always follows every queued buffer, so order holds.
-                self.flattened_writes.reserve(headers_len);
-                headers.write_to(&mut self.flattened_writes);
-                self.write_buf_len += headers_len;
-            }
-            _ => {
-                small_write!("{payload_len}\r\n");
-            }
-        }
-
         self.write(payload);
         self.write("\r\n");
 
@@ -556,6 +534,11 @@ impl Connection {
             payload_len = %payload_len,
             "write operation: PUB"
         );
+    }
+
+    /// Writes a run of publish operations a [`crate::Batch`] already encoded.
+    pub(crate) fn write_encoded(&mut self, wire: Bytes) {
+        self.write(wire);
     }
 
     /// Writes a client operation to the write buffer.
@@ -886,6 +869,53 @@ where
             .poll_close_unpin(cx)
             .map_err(std::io::Error::other)
     }
+}
+
+/// Encodes one publish operation, payload included, exactly as
+/// [`Connection::enqueue_publish`] writes it.
+pub(crate) fn encode_publish(
+    buf: &mut BytesMut,
+    subject: &Subject,
+    payload: &[u8],
+    respond: Option<&Subject>,
+    headers: Option<&HeaderMap>,
+) {
+    encode_head(buf, subject, payload.len(), respond, headers);
+    buf.extend_from_slice(payload);
+    buf.extend_from_slice(b"\r\n");
+}
+
+/// Encodes the operation line of one publish and its headers, and returns its verb.
+fn encode_head(
+    buf: &mut BytesMut,
+    subject: &Subject,
+    payload_len: usize,
+    respond: Option<&Subject>,
+    headers: Option<&HeaderMap>,
+) -> &'static str {
+    let headers = headers.filter(|headers| !headers.is_empty());
+    let verb = if headers.is_some() { "HPUB" } else { "PUB" };
+    buf.extend_from_slice(verb.as_bytes());
+    buf.extend_from_slice(b" ");
+    buf.extend_from_slice(subject.as_str().as_bytes());
+    buf.extend_from_slice(b" ");
+    if let Some(respond) = respond {
+        buf.extend_from_slice(respond.as_str().as_bytes());
+        buf.extend_from_slice(b" ");
+    }
+    match headers {
+        Some(headers) => {
+            let headers_len = headers.wire_len();
+            write!(buf, "{headers_len} {}\r\n", headers_len + payload_len)
+                .expect("write to a BytesMut");
+            buf.reserve(headers_len);
+            headers.write_to(buf);
+        }
+        None => {
+            write!(buf, "{payload_len}\r\n").expect("write to a BytesMut");
+        }
+    }
+    verb
 }
 
 #[cfg(test)]
@@ -1287,9 +1317,10 @@ mod read_op {
 mod write_op {
     use std::sync::Arc;
 
-    use super::Connection;
+    use super::{encode_publish, Connection};
     use crate::{ClientOp, ConnectInfo, HeaderMap, Protocol, Statistics, Subject};
-    use tokio::io::{self, AsyncBufReadExt, BufReader};
+    use bytes::BytesMut;
+    use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, BufReader};
 
     async fn published(
         connection: &mut Connection,
@@ -1349,6 +1380,41 @@ mod write_op {
             buffer,
             "HPUB FOO.BAR INBOX.67 23 34\r\nNATS/1.0\r\nHeader: X\r\n\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn an_encoded_publish_is_the_bytes_the_connection_writes() {
+        let header = || HeaderMap::from_iter([("Header".parse().unwrap(), "X".parse().unwrap())]);
+        let cases = [
+            (None, None),
+            (Some("INBOX.67"), None),
+            (Some("INBOX.67"), Some(HeaderMap::new())),
+            (None, Some(header())),
+            (Some("INBOX.67"), Some(header())),
+        ];
+        for (respond, headers) in cases {
+            let (stream, mut server) = io::duplex(1024);
+            let mut connection =
+                Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));
+            published(&mut connection, respond, headers.clone()).await;
+            drop(connection);
+            let mut written = Vec::new();
+            server.read_to_end(&mut written).await.unwrap();
+
+            let mut encoded = BytesMut::new();
+            let respond = respond.map(Subject::from);
+            let subject = Subject::from("FOO.BAR");
+            let payload = b"Hello World";
+            encode_publish(
+                &mut encoded,
+                &subject,
+                payload,
+                respond.as_ref(),
+                headers.as_ref(),
+            );
+
+            assert_eq!(&encoded[..], &written[..]);
+        }
     }
 
     #[tokio::test]

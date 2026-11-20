@@ -391,7 +391,11 @@ pub type PublishMessage = crate::message::OutboundMessage;
 #[derive(Debug)]
 pub(crate) enum Command {
     Publish(OutboundMessage),
-    PublishBatch(Vec<OutboundMessage>),
+    PublishBatch {
+        wire: Bytes,
+        messages: u64,
+        bytes: u64,
+    },
     Request {
         subject: Subject,
         payload: Bytes,
@@ -963,10 +967,15 @@ impl ConnectionHandler {
 
             Command::Publish(message) => self.publish(message),
 
-            Command::PublishBatch(messages) => {
-                for message in messages {
-                    self.publish(message);
-                }
+            Command::PublishBatch {
+                wire,
+                messages,
+                bytes,
+            } => {
+                let stats = &self.connector.connect_stats;
+                stats.out_messages.add(messages, Ordering::Relaxed);
+                stats.out_bytes.add(bytes, Ordering::Relaxed);
+                self.connection.write_encoded(wire);
             }
 
             Command::Reconnect => {
