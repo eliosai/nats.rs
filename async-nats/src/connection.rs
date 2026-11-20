@@ -487,6 +487,62 @@ impl Connection {
         Ok(())
     }
 
+    /// Writes one PUB or HPUB, taking the payload so a payload built from a `Vec` is
+    /// copied or queued as it is, never promoted to a shared buffer by a clone.
+    pub(crate) fn enqueue_publish(
+        &mut self,
+        subject: &Subject,
+        payload: Bytes,
+        respond: Option<&Subject>,
+        headers: Option<&HeaderMap>,
+    ) {
+        macro_rules! small_write {
+            ($dst:expr) => {
+                write!(self.small_write(), $dst).expect("do small write to Connection");
+            };
+        }
+
+        let verb = match headers {
+            Some(headers) if !headers.is_empty() => "HPUB",
+            _ => "PUB",
+        };
+
+        small_write!("{verb} {subject} ");
+
+        if let Some(respond) = respond {
+            small_write!("{respond} ");
+        }
+
+        let payload_len = payload.len();
+        match headers {
+            Some(headers) if !headers.is_empty() => {
+                let headers_len = headers.wire_len();
+                let total_len = headers_len + payload_len;
+                small_write!("{headers_len} {total_len}\r\n");
+                // Headers go straight into the flattened tail, which
+                // always follows every queued buffer, so order holds.
+                self.flattened_writes.reserve(headers_len);
+                headers.write_to(&mut self.flattened_writes);
+                self.write_buf_len += headers_len;
+            }
+            _ => {
+                small_write!("{payload_len}\r\n");
+            }
+        }
+
+        self.write(payload);
+        self.write("\r\n");
+
+        trace!(
+            verb = %verb,
+            subject = %subject,
+            reply = ?respond,
+            headers = ?headers,
+            payload_len = %payload_len,
+            "write operation: PUB"
+        );
+    }
+
     /// Writes a client operation to the write buffer.
     pub(crate) fn enqueue_write_op(&mut self, item: &ClientOp) {
         macro_rules! small_write {
@@ -504,53 +560,6 @@ impl Connection {
                 self.write("\r\n");
                 trace!(?connect_info, "write operation: CONNECT");
             }
-            ClientOp::Publish {
-                subject,
-                payload,
-                respond,
-                headers,
-            } => {
-                let verb = match headers.as_ref() {
-                    Some(headers) if !headers.is_empty() => "HPUB",
-                    _ => "PUB",
-                };
-
-                small_write!("{verb} {subject} ");
-
-                if let Some(respond) = respond {
-                    small_write!("{respond} ");
-                }
-
-                match headers {
-                    Some(headers) if !headers.is_empty() => {
-                        let headers_len = headers.wire_len();
-                        let total_len = headers_len + payload.len();
-                        small_write!("{headers_len} {total_len}\r\n");
-                        // Headers go straight into the flattened tail, which
-                        // always follows every queued buffer, so order holds.
-                        self.flattened_writes.reserve(headers_len);
-                        headers.write_to(&mut self.flattened_writes);
-                        self.write_buf_len += headers_len;
-                    }
-                    _ => {
-                        let payload_len = payload.len();
-                        small_write!("{payload_len}\r\n");
-                    }
-                }
-
-                self.write(Bytes::clone(payload));
-                self.write("\r\n");
-
-                trace!(
-                    verb = %verb,
-                    subject = %subject,
-                    reply = ?respond,
-                    headers = ?headers,
-                    payload_len = %payload.len(),
-                    "write operation: PUB"
-                );
-            }
-
             ClientOp::Subscribe {
                 sid,
                 subject,
@@ -1220,26 +1229,34 @@ mod write_op {
     use std::sync::Arc;
 
     use super::Connection;
-    use crate::{ClientOp, ConnectInfo, HeaderMap, Protocol, Statistics};
+    use crate::{ClientOp, ConnectInfo, HeaderMap, Protocol, Statistics, Subject};
     use tokio::io::{self, AsyncBufReadExt, BufReader};
+
+    async fn published(
+        connection: &mut Connection,
+        respond: Option<&str>,
+        headers: Option<HeaderMap>,
+    ) {
+        let respond = respond.map(Subject::from);
+        let subject = Subject::from("FOO.BAR");
+        connection.enqueue_publish(
+            &subject,
+            "Hello World".into(),
+            respond.as_ref(),
+            headers.as_ref(),
+        );
+        connection
+            .easy_write_and_flush(std::iter::empty())
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn publish() {
         let (stream, server) = io::duplex(128);
         let mut connection = Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));
 
-        connection
-            .easy_write_and_flush(
-                [ClientOp::Publish {
-                    subject: "FOO.BAR".into(),
-                    payload: "Hello World".into(),
-                    respond: None,
-                    headers: None,
-                }]
-                .iter(),
-            )
-            .await
-            .unwrap();
+        published(&mut connection, None, None).await;
 
         let mut buffer = String::new();
         let mut reader = BufReader::new(server);
@@ -1247,39 +1264,22 @@ mod write_op {
         reader.read_line(&mut buffer).await.unwrap();
         assert_eq!(buffer, "PUB FOO.BAR 11\r\nHello World\r\n");
 
-        connection
-            .easy_write_and_flush(
-                [ClientOp::Publish {
-                    subject: "FOO.BAR".into(),
-                    payload: "Hello World".into(),
-                    respond: Some("INBOX.67".into()),
-                    headers: None,
-                }]
-                .iter(),
-            )
-            .await
-            .unwrap();
+        published(&mut connection, Some("INBOX.67"), None).await;
 
         buffer.clear();
         reader.read_line(&mut buffer).await.unwrap();
         reader.read_line(&mut buffer).await.unwrap();
         assert_eq!(buffer, "PUB FOO.BAR INBOX.67 11\r\nHello World\r\n");
 
-        connection
-            .easy_write_and_flush(
-                [ClientOp::Publish {
-                    subject: "FOO.BAR".into(),
-                    payload: "Hello World".into(),
-                    respond: Some("INBOX.67".into()),
-                    headers: Some(HeaderMap::from_iter([(
-                        "Header".parse().unwrap(),
-                        "X".parse().unwrap(),
-                    )])),
-                }]
-                .iter(),
-            )
-            .await
-            .unwrap();
+        published(
+            &mut connection,
+            Some("INBOX.67"),
+            Some(HeaderMap::from_iter([(
+                "Header".parse().unwrap(),
+                "X".parse().unwrap(),
+            )])),
+        )
+        .await;
 
         buffer.clear();
         reader.read_line(&mut buffer).await.unwrap();
