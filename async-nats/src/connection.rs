@@ -523,12 +523,14 @@ impl Connection {
 
                 match headers {
                     Some(headers) if !headers.is_empty() => {
-                        let headers = headers.to_bytes();
-
-                        let headers_len = headers.len();
+                        let headers_len = headers.wire_len();
                         let total_len = headers_len + payload.len();
                         small_write!("{headers_len} {total_len}\r\n");
-                        self.write(headers);
+                        // Headers go straight into the flattened tail, which
+                        // always follows every queued buffer, so order holds.
+                        self.flattened_writes.reserve(headers_len);
+                        headers.write_to(&mut self.flattened_writes);
+                        self.write_buf_len += headers_len;
                     }
                     _ => {
                         let payload_len = payload.len();
