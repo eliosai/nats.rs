@@ -23,7 +23,7 @@ use crate::ServerInfo;
 use super::{header::HeaderMap, status::StatusCode, Command, Message, Subscriber};
 use crate::delivery::{Delivery, Route, SubscriptionHandle};
 use crate::error::Error;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::future::TryFutureExt;
 use futures_util::{Sink, SinkExt as _, StreamExt};
 use portable_atomic::AtomicU64;
@@ -232,34 +232,38 @@ impl Sink<OutboundMessage> for Client {
     }
 }
 
-/// Messages a [Client] checked as each joined, which [Client::publish_batch] sends as one
-/// command.
+/// Publish operations a [Client] checked and encoded as each message joined, which
+/// [Client::publish_batch] hands the connection as one write.
 #[derive(Debug, Default)]
 pub struct Batch {
-    messages: Vec<OutboundMessage>,
+    wire: BytesMut,
+    messages: usize,
+    bytes: u64,
 }
 
 impl Batch {
-    /// Creates an empty batch with room for `capacity` messages.
+    /// Creates an empty batch with room for `capacity` bytes of encoded operations.
     pub fn with_capacity(capacity: usize) -> Batch {
         Batch {
-            messages: Vec::with_capacity(capacity),
+            wire: BytesMut::with_capacity(capacity),
+            messages: 0,
+            bytes: 0,
         }
     }
 
     /// Returns how many messages the batch holds.
     pub fn len(&self) -> usize {
-        self.messages.len()
+        self.messages
     }
 
     /// Returns whether the batch holds no message.
     pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
+        self.messages == 0
     }
 
-    /// Iterates over the messages in the order they joined.
-    pub fn iter(&self) -> std::slice::Iter<'_, OutboundMessage> {
-        self.messages.iter()
+    /// Returns how many bytes the encoded operations take on the wire.
+    pub fn wire_len(&self) -> usize {
+        self.wire.len()
     }
 }
 
@@ -909,15 +913,32 @@ impl Client {
     /// and keeps every message that joined before it.
     pub fn batch(&self, batch: &mut Batch, message: OutboundMessage) -> Result<(), PublishError> {
         self.check_outbound(&message)?;
-        batch.messages.push(message);
+        let OutboundMessage {
+            subject,
+            payload,
+            reply,
+            headers,
+        } = message;
+        crate::connection::encode_publish(
+            &mut batch.wire,
+            &subject,
+            &payload,
+            reply.as_ref(),
+            headers.as_ref(),
+        );
+        let header_len = headers.as_ref().map_or(0, HeaderMap::len);
+        let reply_len = reply.as_ref().map_or(0, |reply| reply.len());
+        batch.messages += 1;
+        batch.bytes += (payload.len() + reply_len + subject.len() + header_len) as u64;
         Ok(())
     }
 
-    /// Publishes every message of `batch` in order as one command to the connection.
+    /// Publishes every message of `batch` in order as one command to the connection, and
+    /// leaves `batch` empty with the room it had left.
     ///
-    /// Each message was checked as it joined through [Client::batch], so nothing is checked
-    /// again. The connection writes the same operations, in the same order, as one publish
-    /// per message would.
+    /// Each message was checked and encoded as it joined through [Client::batch], so the
+    /// connection writes the same operations, in the same order, as one publish per message
+    /// would, without checking or encoding any of them again.
     ///
     /// # Examples
     /// ```no_run
@@ -935,17 +956,21 @@ impl Client {
     ///     };
     ///     client.batch(&mut batch, message)?;
     /// }
-    /// client.publish_batch(batch).await?;
+    /// client.publish_batch(&mut batch).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn publish_batch(&self, batch: Batch) -> Result<(), PublishError> {
-        if batch.messages.is_empty() {
+    pub async fn publish_batch(&self, batch: &mut Batch) -> Result<(), PublishError> {
+        if batch.is_empty() {
             return Ok(());
         }
-        self.sender
-            .send(Command::PublishBatch(batch.messages))
-            .await?;
+        let command = Command::PublishBatch {
+            wire: batch.wire.split().freeze(),
+            messages: batch.messages as u64,
+            bytes: batch.bytes,
+        };
+        (batch.messages, batch.bytes) = (0, 0);
+        self.sender.send(command).await?;
         Ok(())
     }
 

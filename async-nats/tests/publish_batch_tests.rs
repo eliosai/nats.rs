@@ -59,7 +59,7 @@ mod publish_batch {
                 .batch(&mut batch, outbound("data", &index.to_string()))
                 .unwrap();
         }
-        client.publish_batch(batch).await.unwrap();
+        client.publish_batch(&mut batch).await.unwrap();
         client.publish("data", "after".into()).await.unwrap();
 
         let mut expected = vec!["before".to_owned()];
@@ -86,7 +86,7 @@ mod publish_batch {
 
         let mut batch = async_nats::Batch::default();
         client.batch(&mut batch, carried).unwrap();
-        client.publish_batch(batch).await.unwrap();
+        client.publish_batch(&mut batch).await.unwrap();
 
         let message = tokio::time::timeout(Duration::from_secs(5), subscriber.next()).await;
         let message = message.unwrap().unwrap();
@@ -112,7 +112,7 @@ mod publish_batch {
 
         client.batch(&mut batch, outbound("data", "first")).unwrap();
         let refused = client.batch(&mut batch, outbound("data", &oversized));
-        client.publish_batch(batch).await.unwrap();
+        client.publish_batch(&mut batch).await.unwrap();
 
         assert_eq!(
             refused.map_err(|refused| refused.kind()),
@@ -132,7 +132,7 @@ mod publish_batch {
 
         client.batch(&mut batch, outbound("data", "first")).unwrap();
         let refused = client.batch(&mut batch, outbound("bad subject", "second"));
-        client.publish_batch(batch).await.unwrap();
+        client.publish_batch(&mut batch).await.unwrap();
 
         assert_eq!(
             refused.map_err(|refused| refused.kind()),
@@ -179,7 +179,7 @@ mod publish_batch {
         client.flush().await.unwrap();
 
         client
-            .publish_batch(async_nats::Batch::default())
+            .publish_batch(&mut async_nats::Batch::default())
             .await
             .unwrap();
 
