@@ -178,7 +178,10 @@ mod publish_batch {
         let mut subscriber = client.subscribe("data").await.unwrap();
         client.flush().await.unwrap();
 
-        client.publish_batch(async_nats::Batch::default()).await.unwrap();
+        client
+            .publish_batch(async_nats::Batch::default())
+            .await
+            .unwrap();
 
         client.flush().await.unwrap();
         quiet(&mut subscriber).await;

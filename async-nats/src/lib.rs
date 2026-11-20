@@ -428,12 +428,6 @@ pub(crate) enum Command {
 /// `ClientOp` represents all actions of `Client`.
 #[derive(Debug)]
 pub(crate) enum ClientOp {
-    Publish {
-        subject: Subject,
-        payload: Bytes,
-        respond: Option<Subject>,
-        headers: Option<HeaderMap>,
-    },
     Subscribe {
         sid: u64,
         subject: Subject,
@@ -853,12 +847,8 @@ impl ConnectionHandler {
             Ordering::Relaxed,
         );
 
-        self.connection.enqueue_write_op(&ClientOp::Publish {
-            subject,
-            payload,
-            respond,
-            headers,
-        });
+        self.connection
+            .enqueue_publish(&subject, payload, respond.as_ref(), headers.as_ref());
     }
 
     fn handle_command(&mut self, command: Command) {
@@ -963,14 +953,12 @@ impl ConnectionHandler {
 
                 let respond: Subject = format!("{}{}", multiplexer.prefix, token).into();
 
-                let pub_op = ClientOp::Publish {
-                    subject,
+                self.connection.enqueue_publish(
+                    &subject,
                     payload,
-                    respond: Some(respond),
-                    headers,
-                };
-
-                self.connection.enqueue_write_op(&pub_op);
+                    Some(&respond),
+                    headers.as_ref(),
+                );
             }
 
             Command::Publish(message) => self.publish(message),
