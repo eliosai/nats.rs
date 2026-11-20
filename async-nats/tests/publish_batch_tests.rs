@@ -53,8 +53,13 @@ mod publish_batch {
         client.flush().await.unwrap();
 
         client.publish("data", "before".into()).await.unwrap();
-        let batch = (0..64).map(|index| outbound("data", &index.to_string()));
-        client.publish_batch(batch.collect()).await.unwrap();
+        let mut batch = async_nats::Batch::with_capacity(64);
+        for index in 0..64 {
+            client
+                .batch(&mut batch, outbound("data", &index.to_string()))
+                .unwrap();
+        }
+        client.publish_batch(batch).await.unwrap();
         client.publish("data", "after".into()).await.unwrap();
 
         let mut expected = vec!["before".to_owned()];
@@ -79,7 +84,9 @@ mod publish_batch {
             headers: Some(headers.clone()),
         };
 
-        client.publish_batch(vec![carried]).await.unwrap();
+        let mut batch = async_nats::Batch::default();
+        client.batch(&mut batch, carried).unwrap();
+        client.publish_batch(batch).await.unwrap();
 
         let message = tokio::time::timeout(Duration::from_secs(5), subscriber.next()).await;
         let message = message.unwrap().unwrap();
@@ -95,33 +102,43 @@ mod publish_batch {
     }
 
     #[tokio::test]
-    async fn one_oversized_message_refuses_the_whole_batch_and_sends_nothing() {
+    async fn an_oversized_message_is_refused_as_it_joins_and_the_batch_keeps_the_rest() {
         let server = nats_server::run_basic_server();
         let client = async_nats::connect(server.client_url()).await.unwrap();
         let mut subscriber = client.subscribe("data").await.unwrap();
         client.flush().await.unwrap();
         let oversized = "x".repeat(client.server_info().max_payload + 1);
+        let mut batch = async_nats::Batch::default();
 
-        let batch = vec![outbound("data", "first"), outbound("data", &oversized)];
-        let refused = client.publish_batch(batch).await.unwrap_err();
+        client.batch(&mut batch, outbound("data", "first")).unwrap();
+        let refused = client.batch(&mut batch, outbound("data", &oversized));
+        client.publish_batch(batch).await.unwrap();
 
-        assert_eq!(refused.kind(), PublishErrorKind::MaxPayloadExceeded);
-        client.flush().await.unwrap();
+        assert_eq!(
+            refused.map_err(|refused| refused.kind()),
+            Err(PublishErrorKind::MaxPayloadExceeded)
+        );
+        assert_eq!(payloads(&mut subscriber, 1).await, vec!["first".to_owned()]);
         quiet(&mut subscriber).await;
     }
 
     #[tokio::test]
-    async fn one_invalid_subject_refuses_the_whole_batch_and_sends_nothing() {
+    async fn an_invalid_subject_is_refused_as_it_joins_and_the_batch_keeps_the_rest() {
         let server = nats_server::run_basic_server();
         let client = async_nats::connect(server.client_url()).await.unwrap();
         let mut subscriber = client.subscribe("data").await.unwrap();
         client.flush().await.unwrap();
+        let mut batch = async_nats::Batch::default();
 
-        let batch = vec![outbound("data", "first"), outbound("bad subject", "second")];
-        let refused = client.publish_batch(batch).await.unwrap_err();
+        client.batch(&mut batch, outbound("data", "first")).unwrap();
+        let refused = client.batch(&mut batch, outbound("bad subject", "second"));
+        client.publish_batch(batch).await.unwrap();
 
-        assert_eq!(refused.kind(), PublishErrorKind::InvalidSubject);
-        client.flush().await.unwrap();
+        assert_eq!(
+            refused.map_err(|refused| refused.kind()),
+            Err(PublishErrorKind::InvalidSubject)
+        );
+        assert_eq!(payloads(&mut subscriber, 1).await, vec!["first".to_owned()]);
         quiet(&mut subscriber).await;
     }
 
@@ -161,7 +178,7 @@ mod publish_batch {
         let mut subscriber = client.subscribe("data").await.unwrap();
         client.flush().await.unwrap();
 
-        client.publish_batch(Vec::new()).await.unwrap();
+        client.publish_batch(async_nats::Batch::default()).await.unwrap();
 
         client.flush().await.unwrap();
         quiet(&mut subscriber).await;

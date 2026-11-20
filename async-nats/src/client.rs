@@ -232,6 +232,37 @@ impl Sink<OutboundMessage> for Client {
     }
 }
 
+/// Messages a [Client] checked as each joined, which [Client::publish_batch] sends as one
+/// command.
+#[derive(Debug, Default)]
+pub struct Batch {
+    messages: Vec<OutboundMessage>,
+}
+
+impl Batch {
+    /// Creates an empty batch with room for `capacity` messages.
+    pub fn with_capacity(capacity: usize) -> Batch {
+        Batch {
+            messages: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Returns how many messages the batch holds.
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Returns whether the batch holds no message.
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Iterates over the messages in the order they joined.
+    pub fn iter(&self) -> std::slice::Iter<'_, OutboundMessage> {
+        self.messages.iter()
+    }
+}
+
 impl Client {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -872,11 +903,21 @@ impl Client {
         Ok(SubscriptionHandle::new(sid, self.sender.clone()))
     }
 
-    /// Publishes every message in order as one command to the connection.
+    /// Checks `message` as [Client::check_outbound] does, then adds it to the end of `batch`.
     ///
-    /// Each message's subject and size are checked first, so one refused message refuses the
-    /// whole batch and nothing is sent. The connection writes the same operations, in the same
-    /// order, as one publish per message would.
+    /// A refused message leaves `batch` as it was, so the caller learns which message failed
+    /// and keeps every message that joined before it.
+    pub fn batch(&self, batch: &mut Batch, message: OutboundMessage) -> Result<(), PublishError> {
+        self.check_outbound(&message)?;
+        batch.messages.push(message);
+        Ok(())
+    }
+
+    /// Publishes every message of `batch` in order as one command to the connection.
+    ///
+    /// Each message was checked as it joined through [Client::batch], so nothing is checked
+    /// again. The connection writes the same operations, in the same order, as one publish
+    /// per message would.
     ///
     /// # Examples
     /// ```no_run
@@ -884,24 +925,27 @@ impl Client {
     /// # async fn main() -> Result<(), async_nats::Error> {
     /// use async_nats::message::OutboundMessage;
     /// let client = async_nats::connect("demo.nats.io").await?;
-    /// let messages = (0..3).map(|n: u8| OutboundMessage {
-    ///     subject: "events.data".into(),
-    ///     payload: n.to_string().into(),
-    ///     reply: None,
-    ///     headers: None,
-    /// });
-    /// client.publish_batch(messages.collect()).await?;
+    /// let mut batch = async_nats::Batch::default();
+    /// for n in 0..3u8 {
+    ///     let message = OutboundMessage {
+    ///         subject: "events.data".into(),
+    ///         payload: n.to_string().into(),
+    ///         reply: None,
+    ///         headers: None,
+    ///     };
+    ///     client.batch(&mut batch, message)?;
+    /// }
+    /// client.publish_batch(batch).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn publish_batch(&self, messages: Vec<OutboundMessage>) -> Result<(), PublishError> {
-        for message in &messages {
-            self.check_outbound(message)?;
-        }
-        if messages.is_empty() {
+    pub async fn publish_batch(&self, batch: Batch) -> Result<(), PublishError> {
+        if batch.messages.is_empty() {
             return Ok(());
         }
-        self.sender.send(Command::PublishBatch(messages)).await?;
+        self.sender
+            .send(Command::PublishBatch(batch.messages))
+            .await?;
         Ok(())
     }
 

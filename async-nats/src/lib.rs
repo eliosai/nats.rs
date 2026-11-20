@@ -259,7 +259,7 @@ mod options;
 
 pub use auth::Auth;
 pub use client::{
-    Client, PublishError, PublishErrorKind, Request, RequestError, RequestErrorKind,
+    Batch, Client, PublishError, PublishErrorKind, Request, RequestError, RequestErrorKind,
     ServerPoolError, ServerPoolErrorKind, SetServerPoolError, SetServerPoolErrorKind, Statistics,
     SubscribeError, SubscribeErrorKind,
 };
