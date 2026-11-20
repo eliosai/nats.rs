@@ -272,19 +272,26 @@ impl HeaderMap {
         GetAll { inner }
     }
 
+    #[cfg(test)]
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = vec![];
-        buf.extend_from_slice(b"NATS/1.0\r\n");
+        let mut buf = Vec::with_capacity(self.wire_len());
+        self.write_to(&mut buf);
+        buf
+    }
+
+    /// Appends the serialized header block (as [`HeaderMap::to_bytes`]
+    /// produces) to `buf` without an intermediate allocation.
+    pub(crate) fn write_to(&self, buf: &mut impl bytes::BufMut) {
+        buf.put_slice(b"NATS/1.0\r\n");
         for (k, vs) in &self.inner {
             for v in vs.iter() {
-                buf.extend_from_slice(k.as_str().as_bytes());
-                buf.extend_from_slice(b": ");
-                buf.extend_from_slice(v.inner.as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                buf.put_slice(k.as_str().as_bytes());
+                buf.put_slice(b": ");
+                buf.put_slice(v.inner.as_bytes());
+                buf.put_slice(b"\r\n");
             }
         }
-        buf.extend_from_slice(b"\r\n");
-        buf
+        buf.put_slice(b"\r\n");
     }
 }
 
