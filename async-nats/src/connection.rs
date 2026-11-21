@@ -18,7 +18,7 @@ use std::fmt::{self, Display, Write as _};
 use std::future::{self, Future};
 use std::io::IoSlice;
 use std::pin::Pin;
-use std::str::{self, FromStr};
+use std::str;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -35,7 +35,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 use tracing::trace;
 
-use crate::header::{HeaderMap, HeaderName, IntoHeaderValue};
+use crate::header::{HeaderMap, HeaderName, HeaderValue, IntoHeaderValue};
 use crate::status::StatusCode;
 use crate::subject::Subject;
 use crate::{ClientOp, ServerError, ServerOp, Statistics};
@@ -342,7 +342,7 @@ impl Connection {
             }
 
             self.read_buf.advance(len + 2);
-            let header = self.read_buf.split_to(header_len);
+            let header = self.read_buf.split_to(header_len).freeze();
             let payload = self.read_buf.split_to(total_len - header_len).freeze();
             self.read_buf.advance(2);
 
@@ -395,12 +395,19 @@ impl Connection {
                     io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
                 })?;
 
-                let name = HeaderName::from_str(name)
+                let name = HeaderName::shared(&header, name)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
 
-                // Read the header value, which might have been split into multiple lines
-                // `trim_start` and `trim_end` do the same job as doing `value.trim().to_owned()` at the end, but without a reallocation
-                let mut value = value.trim_start().to_owned();
+                // A value on one line shares the header bytes; one split over several lines is joined
+                let value = value.trim_start();
+                if !lines
+                    .peek()
+                    .is_some_and(|s| s.starts_with(char::is_whitespace))
+                {
+                    headers.append(name, HeaderValue::shared(&header, value.trim_end()));
+                    continue;
+                }
+                let mut value = value.to_owned();
                 while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
                     value.push_str(v);
                 }
@@ -1037,6 +1044,40 @@ mod read_op {
             panic!("expected a message, got {result:?}");
         };
         assert_eq!(headers.unwrap().get("Header").unwrap().as_str(), "a b");
+    }
+
+    #[tokio::test]
+    async fn message_headers_trim_their_values_and_replace_a_lone_carriage_return() {
+        let (stream, mut server) = io::duplex(128);
+        let mut connection = Connection::new(Box::new(stream), 0, Arc::new(Statistics::default()));
+
+        server
+            .write_all(b"HMSG FOO.BAR 10 50 52\r\nNATS/1.0\r\nNats-Msg-Id:  a b  \r\n")
+            .await
+            .unwrap();
+        server
+            .write_all(b"X-Note: one\rtwo\r\n\r\nhi\r\n")
+            .await
+            .unwrap();
+
+        let result = connection.read_op().await.unwrap();
+
+        assert_eq!(
+            result,
+            Some(ServerOp::Message {
+                sid: 10,
+                subject: "FOO.BAR".into(),
+                reply: None,
+                headers: Some(HeaderMap::from_iter([
+                    (crate::header::NATS_MESSAGE_ID, "a b".parse().unwrap()),
+                    ("X-Note".parse().unwrap(), "one two".parse().unwrap()),
+                ])),
+                payload: "hi".into(),
+                status: None,
+                description: None,
+                length: 7 + 50 + 2,
+            })
+        );
     }
 
     #[tokio::test]

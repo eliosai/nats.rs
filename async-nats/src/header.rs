@@ -287,7 +287,7 @@ impl HeaderMap {
             for v in vs.iter() {
                 buf.put_slice(k.as_str().as_bytes());
                 buf.put_slice(b": ");
-                buf.put_slice(v.inner.as_bytes());
+                buf.put_slice(&v.inner);
                 buf.put_slice(b"\r\n");
             }
         }
@@ -310,10 +310,32 @@ impl HeaderMap {
 /// headers.insert("Key", "Value");
 /// headers.insert("Another", "AnotherValue");
 /// ```
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct HeaderValue {
-    inner: String,
+    // Always valid UTF-8 holding no `\r` or `\n`; a received value shares the message's header bytes
+    inner: Bytes,
+}
+
+impl fmt::Debug for HeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeaderValue")
+            .field("inner", &self.as_str())
+            .finish()
+    }
+}
+
+impl Serialize for HeaderValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for HeaderValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|inner| HeaderValue {
+            inner: Bytes::from(inner),
+        })
+    }
 }
 
 impl fmt::Display for HeaderValue {
@@ -337,7 +359,7 @@ impl AsRef<str> for HeaderValue {
 impl From<i16> for HeaderValue {
     fn from(v: i16) -> Self {
         Self {
-            inner: v.to_string(),
+            inner: Bytes::from(v.to_string()),
         }
     }
 }
@@ -345,7 +367,7 @@ impl From<i16> for HeaderValue {
 impl From<i32> for HeaderValue {
     fn from(v: i32) -> Self {
         Self {
-            inner: v.to_string(),
+            inner: Bytes::from(v.to_string()),
         }
     }
 }
@@ -353,7 +375,7 @@ impl From<i32> for HeaderValue {
 impl From<i64> for HeaderValue {
     fn from(v: i64) -> Self {
         Self {
-            inner: v.to_string(),
+            inner: Bytes::from(v.to_string()),
         }
     }
 }
@@ -361,7 +383,7 @@ impl From<i64> for HeaderValue {
 impl From<isize> for HeaderValue {
     fn from(v: isize) -> Self {
         Self {
-            inner: v.to_string(),
+            inner: Bytes::from(v.to_string()),
         }
     }
 }
@@ -369,7 +391,7 @@ impl From<isize> for HeaderValue {
 impl From<u16> for HeaderValue {
     fn from(v: u16) -> Self {
         Self {
-            inner: v.to_string(),
+            inner: Bytes::from(v.to_string()),
         }
     }
 }
@@ -377,7 +399,7 @@ impl From<u16> for HeaderValue {
 impl From<u32> for HeaderValue {
     fn from(v: u32) -> Self {
         Self {
-            inner: v.to_string(),
+            inner: Bytes::from(v.to_string()),
         }
     }
 }
@@ -385,7 +407,7 @@ impl From<u32> for HeaderValue {
 impl From<u64> for HeaderValue {
     fn from(v: u64) -> Self {
         Self {
-            inner: v.to_string(),
+            inner: Bytes::from(v.to_string()),
         }
     }
 }
@@ -393,7 +415,7 @@ impl From<u64> for HeaderValue {
 impl From<usize> for HeaderValue {
     fn from(v: usize) -> Self {
         Self {
-            inner: v.to_string(),
+            inner: Bytes::from(v.to_string()),
         }
     }
 }
@@ -404,7 +426,7 @@ impl FromStr for HeaderValue {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         validate_header_value(s)?;
         Ok(HeaderValue {
-            inner: s.to_string(),
+            inner: Bytes::copy_from_slice(s.as_bytes()),
         })
     }
 }
@@ -434,7 +456,9 @@ impl TryFrom<String> for HeaderValue {
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         validate_header_value(&value)?;
-        Ok(Self { inner: value })
+        Ok(Self {
+            inner: Bytes::from(value),
+        })
     }
 }
 
@@ -458,17 +482,28 @@ impl HeaderValue {
     pub fn from_lossy(value: &str) -> Self {
         if value.contains(['\r', '\n']) {
             Self {
-                inner: value.replace(['\r', '\n'], " "),
+                inner: Bytes::from(value.replace(['\r', '\n'], " ")),
             }
         } else {
             Self {
-                inner: value.to_string(),
+                inner: Bytes::copy_from_slice(value.as_bytes()),
             }
         }
     }
 
     pub fn as_str(&self) -> &str {
-        self.inner.as_str()
+        // SAFETY: every constructor stores the bytes of a `str`
+        unsafe { std::str::from_utf8_unchecked(&self.inner) }
+    }
+
+    /// Holds a value received in a message's header bytes without copying it.
+    pub(crate) fn shared(header: &Bytes, value: &str) -> Self {
+        if value.contains('\r') {
+            return HeaderValue::from_lossy(value);
+        }
+        HeaderValue {
+            inner: header.slice_ref(value.as_bytes()),
+        }
     }
 }
 
@@ -556,7 +591,9 @@ impl IntoHeaderValue for String {
         if self.contains(['\r', '\n']) {
             HeaderValue::from_lossy(&self)
         } else {
-            HeaderValue { inner: self }
+            HeaderValue {
+                inner: Bytes::from(self),
+            }
         }
     }
 }
@@ -807,6 +844,23 @@ impl FromStr for HeaderName {
             },
             None => HeaderName {
                 inner: HeaderRepr::Custom(CustomHeader::from(s)),
+            },
+        })
+    }
+}
+
+impl HeaderName {
+    /// Reads a name received in a message's header bytes without copying it.
+    pub(crate) fn shared(header: &Bytes, name: &str) -> Result<Self, ParseHeaderNameError> {
+        validate_header_name(name)?;
+        Ok(match StandardHeader::from_bytes(name.as_bytes()) {
+            Some(v) => HeaderName {
+                inner: HeaderRepr::Standard(v),
+            },
+            None => HeaderName {
+                inner: HeaderRepr::Custom(CustomHeader {
+                    bytes: header.slice_ref(name.as_bytes()),
+                }),
             },
         })
     }
