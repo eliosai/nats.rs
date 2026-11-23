@@ -346,12 +346,10 @@ impl Connection {
             let payload = self.read_buf.split_to(total_len - header_len).freeze();
             self.read_buf.advance(2);
 
-            let mut lines = std::str::from_utf8(&header)
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "header isn't valid utf-8")
-                })?
-                .lines()
-                .peekable();
+            let mut lines = lines(std::str::from_utf8(&header).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "header isn't valid utf-8")
+            })?)
+            .peekable();
             let version_line = lines.next().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
             })?;
@@ -391,9 +389,16 @@ impl Connection {
                     continue;
                 }
 
-                let (name, value) = line.split_once(':').ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
-                })?;
+                let colon = memchr::memchr(b':', line.as_bytes());
+                let (name, value) =
+                    colon
+                        .map(|at| (&line[..at], &line[at + 1..]))
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "no header version line found",
+                            )
+                        })?;
 
                 let name = HeaderName::shared(&header, name)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
@@ -880,6 +885,21 @@ where
 
 /// Encodes one publish operation, payload included, exactly as
 /// [`Connection::enqueue_publish`] writes it.
+/// Splits header text into lines as `str::lines` does, finding each `\n` with memchr
+fn lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(text).filter(|text| !text.is_empty());
+    std::iter::from_fn(move || {
+        let text = rest?;
+        let Some(at) = memchr::memchr(b'\n', text.as_bytes()) else {
+            rest = None;
+            return Some(text);
+        };
+        rest = Some(&text[at + 1..]).filter(|text| !text.is_empty());
+        let line = &text[..at];
+        Some(line.strip_suffix('\r').unwrap_or(line))
+    })
+}
+
 pub(crate) fn encode_publish(
     buf: &mut BytesMut,
     subject: &Subject,
@@ -929,9 +949,32 @@ fn encode_head(
 mod read_op {
     use std::sync::Arc;
 
-    use super::Connection;
+    use super::{lines, Connection};
     use crate::{HeaderMap, ServerError, ServerInfo, ServerOp, Statistics, StatusCode};
     use tokio::io::{self, AsyncWriteExt};
+
+    #[test]
+    fn header_lines_split_as_str_lines_does() {
+        let texts = [
+            "",
+            "a",
+            "a\n",
+            "a\r\nb\r\n",
+            "a\nb",
+            "a\r",
+            "a\r\r\n",
+            "\n\n",
+            "\r\n",
+            "a\rb\n",
+        ];
+        for text in texts {
+            assert_eq!(
+                lines(text).collect::<Vec<_>>(),
+                text.lines().collect::<Vec<_>>(),
+                "{text:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn ok() {
