@@ -46,8 +46,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HeaderMap {
-    inner: HashMap<HeaderName, Vec<HeaderValue>>,
+    inner: Lines,
 }
+
+/// Every header line by name, hashed with foldhash: its seed is random per map, and it hashes a short name several times faster than SipHash
+type Lines = HashMap<HeaderName, Vec<HeaderValue>, foldhash::fast::RandomState>;
 
 /// Helper enum for backward-compatible deserialization using serde's untagged feature
 /// This is required because of the bug #1470 where the client incorrectly serialized
@@ -56,11 +59,9 @@ pub struct HeaderMap {
 #[serde(untagged)]
 enum HeaderMapHelper {
     // Legacy format with "inner" wrapper
-    Legacy {
-        inner: HashMap<HeaderName, Vec<HeaderValue>>,
-    },
+    Legacy { inner: Lines },
     // Proper format - direct HashMap
-    Current(HashMap<HeaderName, Vec<HeaderValue>>),
+    Current(Lines),
 }
 
 impl<'de> Deserialize<'de> for HeaderMap {
@@ -202,16 +203,9 @@ impl HeaderMap {
     /// headers.append("Key", "Value");
     /// headers.append("Key", "Another");
     pub fn append<K: IntoHeaderName, V: IntoHeaderValue>(&mut self, name: K, value: V) {
-        let key = name.into_header_name();
-        let v = self.inner.get_mut(&key);
-        match v {
-            Some(v) => {
-                v.push(value.into_header_value());
-            }
-            None => {
-                self.insert(key, value.into_header_value());
-            }
-        }
+        let values = self.inner.entry(name.into_header_name());
+        let values = values.or_insert_with(|| Vec::with_capacity(1));
+        values.push(value.into_header_value());
     }
 
     /// Gets a value for a given key. If key is not found, [Option::None] is returned.
@@ -480,7 +474,7 @@ impl HeaderValue {
     /// assert_eq!(value.as_str(), "first second");
     /// ```
     pub fn from_lossy(value: &str) -> Self {
-        if value.contains(['\r', '\n']) {
+        if breaks(value) {
             Self {
                 inner: Bytes::from(value.replace(['\r', '\n'], " ")),
             }
@@ -498,7 +492,7 @@ impl HeaderValue {
 
     /// Holds a value received in a message's header bytes without copying it.
     pub(crate) fn shared(header: &Bytes, value: &str) -> Self {
-        if value.contains('\r') {
+        if memchr::memchr(b'\r', value.as_bytes()).is_some() {
             return HeaderValue::from_lossy(value);
         }
         HeaderValue {
@@ -522,8 +516,13 @@ impl fmt::Display for ParseHeaderValueError {
 
 impl std::error::Error for ParseHeaderValueError {}
 
+/// Reports whether a value holds `\r` or `\n`, either of which would end its header line
+fn breaks(value: &str) -> bool {
+    memchr::memchr2(b'\r', b'\n', value.as_bytes()).is_some()
+}
+
 fn validate_header_value(s: &str) -> Result<(), ParseHeaderValueError> {
-    if s.contains(['\r', '\n']) {
+    if breaks(s) {
         Err(ParseHeaderValueError)
     } else {
         Ok(())
@@ -588,7 +587,7 @@ impl IntoHeaderValue for &str {
 
 impl IntoHeaderValue for String {
     fn into_header_value(self) -> HeaderValue {
-        if self.contains(['\r', '\n']) {
+        if breaks(&self) {
             HeaderValue::from_lossy(&self)
         } else {
             HeaderValue {
